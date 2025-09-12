@@ -1,0 +1,11 @@
+matplotlib
+mediapipe
+numpy
+onnxruntime_gpu
+opencv_contrib_python
+opencv_python
+Pillow
+scikit_learn
+streamlit
+torch
+torchvision
