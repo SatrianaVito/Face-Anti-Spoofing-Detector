@@ -1,0 +1,22 @@
+# Core ML
+torch
+torchvision
+numpy
+scikit-learn
+scipy
+
+# Visualization & utils
+matplotlib
+tqdm
+Pillow
+
+# Computer vision
+opencv-python
+mediapipe
+
+# ONNX export & inference
+onnx
+onnxruntime
+
+# Web app
+streamlit
