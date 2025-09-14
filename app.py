@@ -1,54 +1,49 @@
-import streamlit as st
-import torch  # needed for torchvision transforms tensor type
-from PIL import Image
-import numpy as np
+import os
 import cv2
+import numpy as np
+from PIL import Image
+from functools import lru_cache
+
+import torch  # for torchvision tensor type
 from torchvision import transforms
 import mediapipe as mp
 import onnxruntime as ort
-import os
+import gradio as gr
 
 mp_face = mp.solutions.face_detection
 
 # ----------------------------
 # 1) Load ONNX model (auto-select provider)
 # ----------------------------
-@st.cache_resource(show_spinner=False)
+@lru_cache(maxsize=1)
 def load_onnx_session(onnx_path: str):
     if not os.path.exists(onnx_path):
         raise FileNotFoundError(
             f"ONNX file not found: {onnx_path}. "
             f"Make sure you exported it (e.g., python export_onnx.py)."
         )
+
     available = ort.get_available_providers()
     preferred = [
+        "TensorrtExecutionProvider",  # if available
         "CUDAExecutionProvider",      # GPU (CUDA)
-        "TensorrtExecutionProvider",  # GPU (TensorRT)
-        "CPUExecutionProvider"        # CPU fallback
+        "CPUExecutionProvider",       # CPU fallback
     ]
-    providers = [p for p in preferred if p in available]
-    if not providers:
-        providers = ["CPUExecutionProvider"]
+    providers = [p for p in preferred if p in available] or ["CPUExecutionProvider"]
+
     sess = ort.InferenceSession(onnx_path, providers=providers)
 
-    # Try to use declared names; fall back to actual graph names if different
+    # Try declared names; fall back to actual graph names if needed
     try:
         input_name = "input"
         output_name = "logits"
-        # quick shape check; will throw if name doesn't exist
-        _ = sess.get_inputs()
-        _ = sess.run([output_name], {input_name: np.zeros((1,3,224,224), dtype=np.float32)})
+        _ = sess.run([output_name], {input_name: np.zeros((1, 3, 224, 224), dtype=np.float32)})
     except Exception:
         input_name = sess.get_inputs()[0].name
         output_name = sess.get_outputs()[0].name
 
     return sess, input_name, output_name, providers
 
-try:
-    ort_sess, ORT_INPUT, ORT_OUTPUT, USED_PROVIDERS = load_onnx_session("face_antispoof.onnx")
-except Exception as e:
-    ort_sess, ORT_INPUT, ORT_OUTPUT, USED_PROVIDERS = None, None, None, None
-    st.error(str(e))
 
 # ----------------------------
 # 2) Helpers (face detect + preprocessing + inference)
@@ -95,6 +90,8 @@ def detect_and_crop_face(pil_image, min_size=80, margin=0.25, conf_th=0.5):
     sx1 = cx - half; sy1 = cy - half
     sx2 = cx + half; sy2 = cy + half
     crop = img[sy1:sy2, sx1:sx2]
+    # fix typo (xs2 -> sx2)
+    crop = img[sy1:sy2, sx1:sx2]
     return _to_pil(crop), (sx1, sy1, sx2, sy2)
 
 # ImageNet normalization (required for torchvision-pretrained backbones)
@@ -106,7 +103,7 @@ def _softmax_np(x, axis=1):
     e = np.exp(x)
     return e / np.sum(e, axis=axis, keepdims=True)
 
-@st.cache_data(show_spinner=False)
+@lru_cache(maxsize=2)
 def build_transform(use_imagenet_norm: bool):
     return transforms.Compose([
         transforms.Resize((224, 224)),
@@ -127,28 +124,47 @@ def predict(image: Image.Image, tf, sess, input_name, output_name):
     return pred, probs
 
 # ----------------------------
-# 3) Streamlit UI
+# 3) Gradio UI logic
 # ----------------------------
-st.title("Face Anti-Spoofing Detector")
-st.caption("ONNX Runtime · Providers: " + (", ".join(USED_PROVIDERS) if USED_PROVIDERS else "N/A"))
+def process_images(files, skip_crop, use_imagenet, onnx_path):
+    """
+    Args:
+        files: list of tempfile paths (or None)
+        skip_crop: bool
+        use_imagenet: bool
+        onnx_path: str
+    Returns:
+        providers_text: str
+        gallery_detected: list[(PIL.Image, caption)]
+        gallery_crops: list[(PIL.Image, caption)]
+        table_rows: list of lists for Dataframe
+    """
+    if not files:
+        return ("No files uploaded.",
+                [], [], [])
 
-st.write("Upload one or more images to check if the face is real or spoofed.")
+    try:
+        sess, ORT_INPUT, ORT_OUTPUT, providers = load_onnx_session(onnx_path)
+    except Exception as e:
+        return (f"Model error: {e}", [], [], [])
 
-uploaded_files = st.file_uploader(
-    "Choose images", type=["jpg", "jpeg", "png"], accept_multiple_files=True
-)
+    tfm = build_transform(bool(use_imagenet))
 
-skip_crop = st.checkbox("Skip face crop (use full image)")
-use_imagenet = st.checkbox("Use ImageNet normalization", value=True)
+    gallery_detected = []
+    gallery_crops = []
+    table_rows = []  # [filename, label, real%, spoof%]
 
-tfm = build_transform(use_imagenet)
+    for f in files:
+        # Gradio may pass file objects or paths; handle both
+        path = f.name if hasattr(f, "name") else str(f)
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as e:
+            table_rows.append([os.path.basename(path), f"Load error: {e}", "-", "-"])
+            continue
 
-if uploaded_files and ort_sess is not None:
-    for uploaded_file in uploaded_files:
-        image = Image.open(uploaded_file).convert("RGB")
-
-        # Visualize detection bbox
         disp_img = np.array(image).copy()
+
         if not skip_crop:
             cropped_face, box = detect_and_crop_face(image)
             (x1, y1, x2, y2) = box
@@ -156,12 +172,56 @@ if uploaded_files and ort_sess is not None:
         else:
             cropped_face = image
 
-        st.image(disp_img, caption=f"Uploaded: {uploaded_file.name}", use_container_width=True)
-        st.image(cropped_face, caption="Detected/Cropped Face", width=224)
+        # Prediction
+        try:
+            label_idx, probs = predict(cropped_face, tfm, sess, ORT_INPUT, ORT_OUTPUT)
+            label = "Real" if label_idx == 0 else "Spoof"
+            real_pct = f"{probs[0]*100:.2f}%"
+            spoof_pct = f"{probs[1]*100:.2f}%"
+        except Exception as e:
+            label = f"Inference error: {e}"
+            real_pct = "-"
+            spoof_pct = "-"
 
-        label_idx, probs = predict(cropped_face, tfm, ort_sess, ORT_INPUT, ORT_OUTPUT)
-        label = "Real" if label_idx == 0 else "Spoof"
-        st.success(f"Prediction: {label}")
-        st.info(f"Confidence — Real: {probs[0]*100:.2f}%, Spoof: {probs[1]*100:.2f}%")
-elif uploaded_files and ort_sess is None:
-    st.stop()
+        gallery_detected.append((_to_pil(disp_img), f"Uploaded: {os.path.basename(path)}"))
+        gallery_crops.append((cropped_face, f"Crop · Pred: {label} · Real {real_pct} · Spoof {spoof_pct}"))
+        table_rows.append([os.path.basename(path), label, real_pct, spoof_pct])
+
+    providers_text = "Providers: " + ", ".join(providers) if providers else "Providers: N/A"
+    return providers_text, gallery_detected, gallery_crops, table_rows
+
+
+with gr.Blocks(title="Face Anti-Spoofing Detector (ONNX + Gradio)") as demo:
+    gr.Markdown("# Face Anti-Spoofing Detector")
+    gr.Markdown("ONNX Runtime · Upload one or more images to check if the face is real or spoofed.")
+
+    with gr.Row():
+        files = gr.File(label="Choose images", file_count="multiple", file_types=["image"])
+    with gr.Row():
+        skip_crop = gr.Checkbox(label="Skip face crop (use full image)", value=False)
+        use_imagenet = gr.Checkbox(label="Use ImageNet normalization", value=True)
+        onnx_path = gr.Textbox(label="ONNX path", value="face_antispoof.onnx")
+
+    run_btn = gr.Button("Run")
+
+    providers_out = gr.Markdown()
+    gr.Markdown("### Detected Faces")
+    gallery_detected = gr.Gallery(height="auto", columns=2, preview=True, allow_preview=True)
+    gr.Markdown("### Crops & Predictions")
+    gallery_crops = gr.Gallery(height="auto", columns=4, preview=True, allow_preview=True)
+    results_table = gr.Dataframe(
+        headers=["filename", "prediction", "real_conf", "spoof_conf"],
+        datatype=["str", "str", "str", "str"],
+        interactive=False,
+        wrap=True,
+        label="Results"
+    )
+
+    run_btn.click(
+        fn=process_images,
+        inputs=[files, skip_crop, use_imagenet, onnx_path],
+        outputs=[providers_out, gallery_detected, gallery_crops, results_table]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
