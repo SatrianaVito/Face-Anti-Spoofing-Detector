@@ -1,0 +1,9 @@
+gradio
+onnxruntime
+mediapipe
+protobuf
+torch
+torchvision
+pillow
+opencv-python-headless
+numpy
